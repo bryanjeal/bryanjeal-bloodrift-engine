@@ -225,9 +225,10 @@ pub const World = struct {
 
     /// Iterate all entities that have ALL listed components, calling cb once per chunk.
     ///
-    /// ChunkTuple(Components) is a tuple of []const T slices, one per component type.
-    /// Access them as chunks[0], chunks[1], etc. Prefab entities and entities missing
-    /// any component are excluded at query level.
+    /// ChunkTuple(Components) is a struct of []const T slices, one per component type.
+    /// Access them as chunks.Health, chunks.Position, etc. (field names derived from
+    /// the component type name). Prefab entities and entities missing any component
+    /// are excluded at query level.
     ///
     /// Precondition: all types in Components are registered via registerComponent.
     /// Precondition: cb must not mutate the world (no setComponent/newEntity/deleteEntity).
@@ -253,7 +254,7 @@ pub const World = struct {
             var chunks: ChunkTuple(Components) = undefined;
             var valid = true;
             inline for (Components, 0..) |T, i| {
-                const fname = comptime std.fmt.comptimePrint("{d}", .{i});
+                const fname = comptime typeBaseName(T);
                 if (zflecs.field(&it, T, i)) |slice| {
                     @field(chunks, fname) = slice;
                 } else {
@@ -261,7 +262,7 @@ pub const World = struct {
                 }
             }
             if (!valid) continue;
-            std.debug.assert(ents.len == @field(chunks, "0").len);
+            std.debug.assert(ents.len == @field(chunks, typeBaseName(Components[0])).len);
             cb(ctx, ents, chunks);
         }
     }
@@ -271,15 +272,16 @@ pub const World = struct {
 // ChunkTuple
 // ============================================================================
 
-/// Comptime-generated tuple of component slices for eachN callbacks.
-/// ChunkTuple(&[_]type{A, B}) produces a tuple with fields "0": []const A, "1": []const B.
-/// Access via chunks[0], chunks[1], or @field(chunks, "0") etc.
+/// Comptime-generated struct of component slices for eachN callbacks.
+/// ChunkTuple(&[_]type{A, B}) produces a struct with fields A: []const A, B: []const B
+/// (field names derived from the component type name).
+/// Access via chunks.Health, chunks.Position, etc.
 pub fn ChunkTuple(comptime Components: []const type) type {
     comptime var fields: [Components.len]std.builtin.Type.StructField = undefined;
     comptime {
         for (Components, 0..) |T, i| {
             fields[i] = .{
-                .name = std.fmt.comptimePrint("{d}", .{i}),
+                .name = typeBaseName(T),
                 .type = []const T,
                 .default_value_ptr = null,
                 .is_comptime = false,
@@ -293,9 +295,21 @@ pub fn ChunkTuple(comptime Components: []const type) type {
             .backing_integer = null,
             .fields = &fields,
             .decls = &.{},
-            .is_tuple = true,
+            .is_tuple = false,
         },
     });
+}
+
+/// Extracts the base type name (after the last '.') from a fully qualified type.
+/// e.g., typeBaseName(components.Health) returns "Health".
+fn typeBaseName(comptime T: type) [:0]const u8 {
+    const full = @typeName(T);
+    comptime var i = full.len;
+    while (i > 0) {
+        i -= 1;
+        if (full[i] == '.') return full[i + 1 .. :0];
+    }
+    return full;
 }
 
 // ============================================================================
@@ -808,7 +822,7 @@ test "World.eachN: component slices are correct length and accessible" {
         fn cb(raw: *anyopaque, entities: []const EntityId, chunks: ChunkTuple(&[_]type{ TestPosition, TestVelocity })) void {
             const c: *SumCtx = @ptrCast(@alignCast(raw));
             c.count.* += @intCast(entities.len);
-            for (chunks[0], chunks[1]) |pos, vel| {
+            for (chunks.TestPosition, chunks.TestVelocity) |pos, vel| {
                 c.pos.* += pos.x;
                 c.vel.* += vel.vx;
             }
