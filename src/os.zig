@@ -15,7 +15,9 @@ const builtin = @import("builtin");
 
 /// Send all bytes over a socket. Blocks until complete.
 /// On Windows: uses ws2_32.send() (ReadFile/WriteFile fail on SOCKET handles).
-/// On POSIX: uses std.net.Stream.writeAll().
+/// On POSIX: uses std.net.Stream.write() in a manual loop.  Stream.writeAll() is
+/// deprecated in Zig 0.15 and creates a temporary Writer per call, which can lose
+/// error state on large payloads.  The manual loop reuses the same Stream handle.
 pub fn socketSendAll(handle: std.net.Stream.Handle, bytes: []const u8) !void {
     if (comptime builtin.os.tag == .windows) {
         const ws2 = std.os.windows.ws2_32;
@@ -37,13 +39,16 @@ pub fn socketSendAll(handle: std.net.Stream.Handle, bytes: []const u8) !void {
         }
     } else {
         const stream = std.net.Stream{ .handle = handle };
-        try stream.writeAll(bytes);
+        var index: usize = 0;
+        while (index < bytes.len) {
+            index += try stream.write(bytes[index..]);
+        }
     }
 }
 
 /// Receive bytes from a socket. Returns number of bytes read, or 0 on close.
 /// On Windows: uses ws2_32.recv() with proper WSA error translation.
-/// On POSIX: uses std.net.Stream.read().
+/// On POSIX: uses std.net.Stream.read() (deprecated but functional for sockets).
 pub fn socketRecv(handle: std.net.Stream.Handle, buf: []u8) !usize {
     if (comptime builtin.os.tag == .windows) {
         const ws2 = std.os.windows.ws2_32;
