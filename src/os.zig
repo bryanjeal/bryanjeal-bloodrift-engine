@@ -15,9 +15,12 @@ const builtin = @import("builtin");
 
 /// Send all bytes over a socket. Blocks until complete.
 /// On Windows: uses ws2_32.send() (ReadFile/WriteFile fail on SOCKET handles).
-/// On POSIX: uses std.net.Stream.write() in a manual loop.  Stream.writeAll() is
-/// deprecated in Zig 0.15 and creates a temporary Writer per call, which can lose
-/// error state on large payloads.  The manual loop reuses the same Stream handle.
+/// On POSIX: uses std.posix.send() with MSG_NOSIGNAL.
+///
+/// Zig 0.15.2 Stream.write() masks the real sendmsg error behind WriteFailed
+/// because the deprecated write() method propagates the Io.Writer.Error before
+/// checking stream_writer.err for the underlying posix error.  We bypass Stream
+/// on both platforms: ws2_32 on Windows, std.posix on POSIX.
 pub fn socketSendAll(handle: std.net.Stream.Handle, bytes: []const u8) !void {
     if (comptime builtin.os.tag == .windows) {
         const ws2 = std.os.windows.ws2_32;
@@ -38,17 +41,18 @@ pub fn socketSendAll(handle: std.net.Stream.Handle, bytes: []const u8) !void {
             };
         }
     } else {
-        const stream = std.net.Stream{ .handle = handle };
-        var index: usize = 0;
-        while (index < bytes.len) {
-            index += try stream.write(bytes[index..]);
+        const flags = std.posix.MSG.NOSIGNAL;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            sent += try std.posix.send(handle, bytes[sent..], flags);
         }
     }
 }
 
 /// Receive bytes from a socket. Returns number of bytes read, or 0 on close.
 /// On Windows: uses ws2_32.recv() with proper WSA error translation.
-/// On POSIX: uses std.net.Stream.read() (deprecated but functional for sockets).
+/// On POSIX: uses std.posix.recv().  Same rationale as socketSendAll: the
+/// deprecated Stream.read() masks the real error behind ReadFailed.
 pub fn socketRecv(handle: std.net.Stream.Handle, buf: []u8) !usize {
     if (comptime builtin.os.tag == .windows) {
         const ws2 = std.os.windows.ws2_32;
@@ -64,8 +68,7 @@ pub fn socketRecv(handle: std.net.Stream.Handle, buf: []u8) !usize {
             else => error.ConnectionResetByPeer,
         };
     } else {
-        const stream = std.net.Stream{ .handle = handle };
-        return stream.read(buf);
+        return std.posix.recv(handle, buf, 0);
     }
 }
 
