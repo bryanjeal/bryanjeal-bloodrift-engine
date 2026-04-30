@@ -36,15 +36,9 @@ pub fn sendFrame(t: transport.Transport, payload: []const u8) !void {
     std.debug.assert(payload.len <= max_frame_bytes);
     var header: [header_bytes]u8 = undefined;
     std.mem.writeInt(u32, &header, @intCast(payload.len), .big);
-    t.send(&header) catch |err| {
-        std.debug.print("[framing] header send failed (payload={}B): {s}\n", .{ payload.len, @errorName(err) });
-        return err;
-    };
+    try t.send(&header);
     if (payload.len > 0) {
-        t.send(payload) catch |err2| {
-            std.debug.print("[framing] payload send failed ({}B): {s}\n", .{ payload.len, @errorName(err2) });
-            return err2;
-        };
+        try t.send(payload);
     }
 }
 
