@@ -44,7 +44,10 @@ pub fn socketSendAll(handle: std.net.Stream.Handle, bytes: []const u8) !void {
         const flags = std.posix.MSG.NOSIGNAL;
         var sent: usize = 0;
         while (sent < bytes.len) {
-            sent += try std.posix.send(handle, bytes[sent..], flags);
+            sent += std.posix.send(handle, bytes[sent..], flags) catch |err| {
+                std.debug.print("[os.socketSendAll] send failed at {}/{}: {s}\n", .{ sent, bytes.len, @errorName(err) });
+                return err;
+            };
         }
     }
 }
