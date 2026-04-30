@@ -417,8 +417,63 @@ pub const VulkanBackend = struct {
                 @as(u32, @intCast(frame)) * 2,
             );
         }
+    }
+
+    /// Submit a sorted render queue. Uploads instances to SSBO, pushes VP
+    /// matrix once, then issues one instanced draw per material range.
+    ///
+    /// SSBO upload + host-write barrier MUST happen before cmdBeginRenderPass.
+    /// Vulkan prohibits HOST_BIT as a source pipeline stage inside a render
+    /// pass (even with a subpass self-dependency).  MoltenVK also requires
+    /// the barrier for host-coherent SSBO visibility on macOS.
+    pub fn submitQueue(self: *VulkanBackend, queue: renderer_mod.RenderQueue) !void {
+        if (self.is_stale) return;
+        const cmd = self.commands.buffers[self.current_frame];
+        const vkd = self.device.vkd;
+        const dev = self.device.handle;
+
+        // Upload instance data + barrier OUTSIDE the render pass.  This is
+        // the only window between beginCommandBuffer and cmdBeginRenderPass
+        // where host-stage pipeline barriers are valid.
+        if (queue.count > 0) {
+            const upload_size = queue.count * @sizeOf(renderer_mod.InstanceData);
+            const atom_size = self.device.properties.limits.non_coherent_atom_size;
+            const flush_size = std.mem.alignForward(u64, upload_size, atom_size);
+
+            @memcpy(self.instance_buffer_ptr[0..upload_size], @as([*]const u8, @ptrCast(queue.instances.ptr))[0..upload_size]);
+            const flush_range = vk.MappedMemoryRange{
+                .memory = self.instance_buffer_memory,
+                .offset = 0,
+                .size = flush_size,
+            };
+            vkd.flushMappedMemoryRanges(dev, 1, @ptrCast(&flush_range)) catch {};
+
+            // Pipeline barrier: ensure host writes to the SSBO are visible to
+            // shader reads before any draw.  MoltenVK requires an explicit
+            // barrier — without it the GPU may read stale cached data, causing
+            // vertex corruption (giant screen spikes) and missing geometry
+            // (grid floor flickering).
+            const mem_barrier = vk.MemoryBarrier{
+                .src_access_mask = .{ .host_write_bit = true },
+                .dst_access_mask = .{ .shader_read_bit = true },
+            };
+            vkd.cmdPipelineBarrier(
+                cmd,
+                .{ .host_bit = true },
+                .{ .vertex_shader_bit = true, .fragment_shader_bit = true },
+                .{},
+                1,
+                @ptrCast(&mem_barrier),
+                0,
+                null,
+                0,
+                null,
+            );
+        }
+
+        // Begin render pass (always — ImGui draws in endFrame need it).
         const clear = vk.ClearValue{ .color = .{ .float_32 = .{ 0.05, 0.05, 0.05, 1.0 } } };
-        vkd.cmdBeginRenderPass(self.commands.buffers[frame], &.{
+        vkd.cmdBeginRenderPass(cmd, &.{
             .render_pass = self.pipeline.render_pass,
             .framebuffer = self.commands.framebuffers[self.current_image],
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = self.swapchain.extent },
@@ -438,16 +493,15 @@ pub const VulkanBackend = struct {
             .max_depth = 1,
         };
         const scissor = vk.Rect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.swapchain.extent };
-        vkd.cmdSetViewport(self.commands.buffers[frame], 0, 1, @ptrCast(&vp));
-        vkd.cmdSetScissor(self.commands.buffers[frame], 0, 1, @ptrCast(&scissor));
+        vkd.cmdSetViewport(cmd, 0, 1, @ptrCast(&vp));
+        vkd.cmdSetScissor(cmd, 0, 1, @ptrCast(&scissor));
         // Bind the shared vertex buffer (unit quad) once for the entire frame.
         const offset: vk.DeviceSize = 0;
-        vkd.cmdBindVertexBuffers(self.commands.buffers[frame], 0, 1, @ptrCast(&self.vertex_buffer), @ptrCast(&offset));
+        vkd.cmdBindVertexBuffers(cmd, 0, 1, @ptrCast(&self.vertex_buffer), @ptrCast(&offset));
         // Bind the instance SSBO descriptor set for the entire frame.
         vkd.cmdBindDescriptorSets(
-            self.commands.buffers[frame],
+            cmd,
             .graphics,
-            // Use the first material's layout (all share the same set layout).
             self.material_layouts[0],
             0,
             1,
@@ -455,57 +509,11 @@ pub const VulkanBackend = struct {
             0,
             null,
         );
-    }
 
-    /// Submit a sorted render queue. Uploads instances to SSBO, pushes VP
-    /// matrix once, then issues one instanced draw per material range.
-    pub fn submitQueue(self: *VulkanBackend, queue: renderer_mod.RenderQueue) !void {
-        if (self.is_stale) return;
         if (queue.count == 0) return;
-        const cmd = self.commands.buffers[self.current_frame];
-        const vkd = self.device.vkd;
-        const dev = self.device.handle;
-
-        // Upload instance data to the persistently-mapped SSBO.
-        const upload_size = queue.count * @sizeOf(renderer_mod.InstanceData);
-        const atom_size = self.device.properties.limits.non_coherent_atom_size;
-        // Round up to the next multiple of the device's atom size
-        const flush_size = std.mem.alignForward(u64, upload_size, atom_size);
-
-        @memcpy(self.instance_buffer_ptr[0..upload_size], @as([*]const u8, @ptrCast(queue.instances.ptr))[0..upload_size]);
-        // Flush for host-coherent memory (ensures GPU sees the writes).
-        const flush_range = vk.MappedMemoryRange{
-            .memory = self.instance_buffer_memory,
-            .offset = 0,
-            .size = flush_size,
-        };
-        vkd.flushMappedMemoryRanges(dev, 1, @ptrCast(&flush_range)) catch {};
-
-        // Pipeline barrier: ensure host writes to the SSBO are visible to
-        // shader reads before any draw.  MoltenVK requires an explicit
-        // barrier — without it the GPU may read stale cached data, causing
-        // vertex corruption (giant screen spikes) and missing geometry
-        // (grid floor flickering).
-        const mem_barrier = vk.MemoryBarrier{
-            .src_access_mask = .{ .host_write_bit = true },
-            .dst_access_mask = .{ .shader_read_bit = true },
-        };
-        vkd.cmdPipelineBarrier(
-            cmd,
-            .{ .host_bit = true },
-            .{ .vertex_shader_bit = true, .fragment_shader_bit = true },
-            .{},
-            1,
-            @ptrCast(&mem_barrier),
-            0,
-            null,
-            0,
-            null,
-        );
 
         // Push VP matrix as a single push constant.
         const push = FramePushData{ .vp = self.current_vp };
-        // Push to first material's layout (all materials share the same push range).
         vkd.cmdPushConstants(
             cmd,
             self.material_layouts[0],
@@ -519,8 +527,6 @@ pub const VulkanBackend = struct {
         var prev_material: u16 = std.math.maxInt(u16);
         for (queue.ranges[0..queue.range_count]) |range| {
             std.debug.assert(range.material_id < max_materials);
-            // Bind pipeline only when material changes (sorted data guarantees
-            // each material range is contiguous).
             if (range.material_id != prev_material) {
                 vkd.cmdBindPipeline(cmd, .graphics, self.material_pipelines[range.material_id]);
                 prev_material = range.material_id;
