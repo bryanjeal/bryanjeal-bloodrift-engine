@@ -60,7 +60,10 @@ pub const TcpTransport = struct {
     fn sendImpl(ptr: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *TcpTransport = @ptrCast(@alignCast(ptr));
         std.debug.assert(bytes.len > 0);
-        try os.socketSendAll(self.stream.handle, bytes);
+        os.socketSendAll(self.stream.handle, bytes) catch |err| {
+            std.debug.print("[tcp.sendImpl] send failed ({}B): {s}\n", .{ bytes.len, @errorName(err) });
+            return err;
+        };
     }
 
     fn recvImpl(ptr: *anyopaque, buf: []u8) anyerror!usize {
