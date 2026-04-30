@@ -481,6 +481,28 @@ pub const VulkanBackend = struct {
         };
         vkd.flushMappedMemoryRanges(dev, 1, @ptrCast(&flush_range)) catch {};
 
+        // Pipeline barrier: ensure host writes to the SSBO are visible to
+        // shader reads before any draw.  MoltenVK requires an explicit
+        // barrier — without it the GPU may read stale cached data, causing
+        // vertex corruption (giant screen spikes) and missing geometry
+        // (grid floor flickering).
+        const mem_barrier = vk.MemoryBarrier{
+            .src_access_mask = .{ .host_write_bit = true },
+            .dst_access_mask = .{ .shader_read_bit = true },
+        };
+        vkd.cmdPipelineBarrier(
+            cmd,
+            .{ .host_bit = true },
+            .{ .vertex_shader_bit = true, .fragment_shader_bit = true },
+            .{},
+            1,
+            @ptrCast(&mem_barrier),
+            0,
+            null,
+            0,
+            null,
+        );
+
         // Push VP matrix as a single push constant.
         const push = FramePushData{ .vp = self.current_vp };
         // Push to first material's layout (all materials share the same push range).
