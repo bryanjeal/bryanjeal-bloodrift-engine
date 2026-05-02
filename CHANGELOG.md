@@ -2,6 +2,26 @@
 
 All changes to the Blood Rift Engine, newest first.
 
+## [2026-05-01] Detect optimal SSBO upload path at init, fix MoltenVK coherency
+
+**Summary:** On macOS with MoltenVK (unified memory), `vkCmdCopyBuffer` between two
+`MTLStorageModeShared` buffers can be a no-op because they share physical memory,
+causing GPU cache-coherency bugs (MoltenVK issue #1846).  The fix detects the
+memory type at init and picks the optimal upload path: `vkCmdCopyBuffer` via
+staging buffer for discrete GPUs, `vkCmdUpdateBuffer` directly from host pointer
+for unified memory.  Also adds `IMMEDIATE_KHR` present-mode fallback for older
+MoltenVK versions that lack `MAILBOX_KHR`.
+
+**Changes:**
+- `vulkan/backend.zig`: Added `UploadMethod` enum + `upload_method` field.
+  `createInstanceBuffer` tries `DEVICE_LOCAL` first; on failure creates a single
+  `HOST_VISIBLE` buffer (no staging).  `submitQueue` dispatches to `vkCmdCopyBuffer`
+  (discrete) or chunked `vkCmdUpdateBuffer` (unified).  Barrier changed from global
+  `vk.MemoryBarrier` to `vk.BufferMemoryBarrier` targeting the SSBO.
+- `vulkan/swapchain.zig`: `choosePresentMode` now prefers `MAILBOX_KHR` >
+  `IMMEDIATE_KHR` > `FIFO_KHR` for uncapped FPS on MoltenVK versions that do not
+  expose `MAILBOX_KHR`.
+
 ## [2026-04-12] Replace runtime vtable Renderer with comptime backend abstraction
 
 **Summary:** Remove the runtime vtable-based Renderer abstraction and replace it with a comptime-validated backend selection layer. Backends are now chosen at build time via `-Dbackend=` and validated at compile time via `assertRendererInterface`.

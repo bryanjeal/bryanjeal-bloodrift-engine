@@ -52,6 +52,16 @@ comptime {
     std.debug.assert(@sizeOf(FramePushData) == 64);
 }
 
+/// How instance data reaches the SSBO each frame.  Chosen at init time based on
+/// whether DEVICE_LOCAL memory is available (discrete GPU) or we fall back to
+/// HOST_VISIBLE (unified memory: Apple Silicon, Intel iGPU).
+const UploadMethod = enum {
+    /// Discrete GPU path: memcpy to staging buffer + vkCmdCopyBuffer (DMA).
+    staging_copy,
+    /// Unified-memory path: vkCmdUpdateBuffer directly from host pointer.
+    update_buffer,
+};
+
 pub const VulkanBackend = struct {
     allocator: std.mem.Allocator,
     surface: vk.SurfaceKHR,
@@ -63,15 +73,16 @@ pub const VulkanBackend = struct {
     vertex_buffer: vk.Buffer,
     vertex_buffer_memory: vk.DeviceMemory,
     imgui_descriptor_pool: vk.DescriptorPool,
-    // Instance SSBO: device-local buffer for per-instance data read by shaders.
+    // Instance SSBO: per-instance data read by shaders, updated each frame
+    // via either staging_copy (discrete GPU) or update_buffer (unified memory).
     instance_buffer: vk.Buffer,
     instance_buffer_memory: vk.DeviceMemory,
-    // Staging buffer: host-visible buffer for CPU writes, copied to SSBO via
-    // vkCmdCopyBuffer each frame.  Avoids the HOST_BIT pipeline barrier which
-    // MoltenVK/Metal does not reliably support.
+    upload_method: UploadMethod,
+    // Staging buffer: only used when upload_method == .staging_copy.
+    // Host-visible, CPU writes via memcpy, GPU reads via vkCmdCopyBuffer.
     staging_buffer: vk.Buffer,
     staging_memory: vk.DeviceMemory,
-    staging_ptr: [*]u8, // persistently mapped pointer
+    staging_ptr: [*]u8,
     // Descriptor set for SSBO binding.
     descriptor_pool: vk.DescriptorPool,
     descriptor_set_layout: vk.DescriptorSetLayout,
@@ -166,7 +177,7 @@ pub const VulkanBackend = struct {
         const imgui_pool = try createImguiDescriptorPool(dev.vkd, dev.handle);
         errdefer dev.vkd.destroyDescriptorPool(dev.handle, imgui_pool, null);
 
-        // Create SSBO + staging buffer for instance data.
+        // Create SSBO for instance data (upload path auto-detected).
         const ssbo = try createInstanceBuffer(
             inst.vki,
             dev.vkd,
@@ -175,8 +186,10 @@ pub const VulkanBackend = struct {
             max_instances * @sizeOf(renderer_mod.InstanceData),
         );
         errdefer {
-            dev.vkd.destroyBuffer(dev.handle, ssbo.staging, null);
-            dev.vkd.freeMemory(dev.handle, ssbo.staging_memory, null);
+            if (ssbo.upload_method == .staging_copy) {
+                dev.vkd.destroyBuffer(dev.handle, ssbo.staging, null);
+                dev.vkd.freeMemory(dev.handle, ssbo.staging_memory, null);
+            }
             dev.vkd.destroyBuffer(dev.handle, ssbo.ssbo, null);
             dev.vkd.freeMemory(dev.handle, ssbo.ssbo_memory, null);
         }
@@ -275,6 +288,7 @@ pub const VulkanBackend = struct {
             .imgui_descriptor_pool = imgui_pool,
             .instance_buffer = ssbo.ssbo,
             .instance_buffer_memory = ssbo.ssbo_memory,
+            .upload_method = ssbo.upload_method,
             .staging_buffer = ssbo.staging,
             .staging_memory = ssbo.staging_memory,
             .staging_ptr = ssbo.staging_ptr,
@@ -306,9 +320,11 @@ pub const VulkanBackend = struct {
         self.device.vkd.destroyDescriptorPool(self.device.handle, self.descriptor_pool, null);
         self.device.vkd.destroyBuffer(self.device.handle, self.instance_buffer, null);
         self.device.vkd.freeMemory(self.device.handle, self.instance_buffer_memory, null);
-        self.device.vkd.unmapMemory(self.device.handle, self.staging_memory);
-        self.device.vkd.destroyBuffer(self.device.handle, self.staging_buffer, null);
-        self.device.vkd.freeMemory(self.device.handle, self.staging_memory, null);
+        if (self.upload_method == .staging_copy) {
+            self.device.vkd.unmapMemory(self.device.handle, self.staging_memory);
+            self.device.vkd.destroyBuffer(self.device.handle, self.staging_buffer, null);
+            self.device.vkd.freeMemory(self.device.handle, self.staging_memory, null);
+        }
         self.device.vkd.destroyDescriptorPool(self.device.handle, self.imgui_descriptor_pool, null);
         if (self.timestamp_query_pool != .null_handle) {
             self.device.vkd.destroyQueryPool(self.device.handle, self.timestamp_query_pool, null);
@@ -430,12 +446,12 @@ pub const VulkanBackend = struct {
         }
     }
 
-    /// Submit a sorted render queue. Uploads instances via staging buffer to
-    /// the device-local SSBO, then issues one instanced draw per material range.
+    /// Submit a sorted render queue.  Uploads instance data to the SSBO, then
+    /// issues one instanced draw per material range.
     ///
-    /// CPU write to staging -> vkCmdCopyBuffer to SSBO -> TRANSFER barrier ->
-    /// cmdBeginRenderPass -> draws.  The TRANSFER stage works reliably on all
-    /// Vulkan implementations including MoltenVK/Metal.
+    /// Upload path (chosen at init):
+    ///   staging_copy: memcpy -> flush -> vkCmdCopyBuffer -> TRANSFER barrier
+    ///   update_buffer: vkCmdUpdateBuffer (chunked) -> TRANSFER barrier
     pub fn submitQueue(self: *VulkanBackend, queue: renderer_mod.RenderQueue) !void {
         if (self.is_stale) return;
         const cmd = self.commands.buffers[self.current_frame];
@@ -443,46 +459,66 @@ pub const VulkanBackend = struct {
         const dev = self.device.handle;
 
         // Upload instance data OUTSIDE the render pass.
-        // Flow: memcpy to staging (CPU) -> vkCmdCopyBuffer (GPU TRANSFER) ->
-        // pipeline barrier (TRANSFER -> SHADER) -> begin render pass -> draws.
-        // Uses the TRANSFER pipeline stage instead of HOST, which MoltenVK
-        // translates to Metal blit-encoder synchronization (reliable).
         if (queue.count > 0) {
             const upload_size = queue.count * @sizeOf(renderer_mod.InstanceData);
-            const atom_size = self.device.properties.limits.non_coherent_atom_size;
-            const flush_size = std.mem.alignForward(u64, upload_size, atom_size);
 
-            // CPU write to staging buffer.
-            @memcpy(self.staging_ptr[0..upload_size], @as([*]const u8, @ptrCast(queue.instances.ptr))[0..upload_size]);
-            const flush_range = vk.MappedMemoryRange{
-                .memory = self.staging_memory,
-                .offset = 0,
-                .size = flush_size,
-            };
-            vkd.flushMappedMemoryRanges(dev, 1, @ptrCast(&flush_range)) catch {};
+            switch (self.upload_method) {
+                .staging_copy => {
+                    // Discrete GPU: memcpy to staging, flush, DMA copy.
+                    const atom_size = self.device.properties.limits.non_coherent_atom_size;
+                    const flush_size = std.mem.alignForward(u64, upload_size, atom_size);
+                    @memcpy(self.staging_ptr[0..upload_size], @as([*]const u8, @ptrCast(queue.instances.ptr))[0..upload_size]);
+                    const flush_range = vk.MappedMemoryRange{
+                        .memory = self.staging_memory,
+                        .offset = 0,
+                        .size = flush_size,
+                    };
+                    // HOST_COHERENT memory was requested: the GPU automatically
+                    // sees CPU writes without an explicit flush.  The call is a
+                    // defensive no-op; if it somehow fails, the barrier below
+                    // still ensures correct ordering.
+                    _ = vkd.flushMappedMemoryRanges(dev, 1, @ptrCast(&flush_range)) catch {};
+                    const copy_region = vk.BufferCopy{
+                        .src_offset = 0,
+                        .dst_offset = 0,
+                        .size = upload_size,
+                    };
+                    vkd.cmdCopyBuffer(cmd, self.staging_buffer, self.instance_buffer, 1, @ptrCast(&copy_region));
+                },
+                .update_buffer => {
+                    // Unified memory: vkCmdUpdateBuffer reads directly from the
+                    // host pointer, avoiding the cache-coherency issue of
+                    // vkCmdCopyBuffer on MoltenVK (issue #1846).  Chunked to
+                    // respect maxUpdateBufferSize (guaranteed >= 65536).
+                    const src: [*]const u8 = @ptrCast(queue.instances.ptr);
+                    var offset: vk.DeviceSize = 0;
+                    while (offset < upload_size) {
+                        const chunk: vk.DeviceSize = @min(upload_size - offset, 65536);
+                        vkd.cmdUpdateBuffer(cmd, self.instance_buffer, offset, chunk, src + offset);
+                        offset += chunk;
+                    }
+                },
+            }
 
-            // GPU copy: staging -> device-local SSBO.
-            const copy_region = vk.BufferCopy{
-                .src_offset = 0,
-                .dst_offset = 0,
-                .size = upload_size,
-            };
-            vkd.cmdCopyBuffer(cmd, self.staging_buffer, self.instance_buffer, 1, @ptrCast(&copy_region));
-
-            // Pipeline barrier: make the transfer write visible to shader reads.
-            const mem_barrier = vk.MemoryBarrier{
+            // Buffer memory barrier: TRANSFER_WRITE -> SHADER_READ.
+            const buf_barrier = vk.BufferMemoryBarrier{
                 .src_access_mask = .{ .transfer_write_bit = true },
                 .dst_access_mask = .{ .shader_read_bit = true },
+                .src_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+                .dst_queue_family_index = vk.QUEUE_FAMILY_IGNORED,
+                .buffer = self.instance_buffer,
+                .offset = 0,
+                .size = vk.WHOLE_SIZE,
             };
             vkd.cmdPipelineBarrier(
                 cmd,
                 .{ .transfer_bit = true },
                 .{ .vertex_shader_bit = true, .fragment_shader_bit = true },
                 .{},
-                1,
-                @ptrCast(&mem_barrier),
                 0,
                 null,
+                1,
+                @ptrCast(&buf_barrier),
                 0,
                 null,
             );
@@ -770,12 +806,13 @@ fn createVertexBuffer(
     return .{ .buffer = buf, .memory = mem };
 }
 
-/// Create device-local SSBO + host-visible staging buffer for instance data.
+/// Create SSBO for instance data, detecting the optimal upload path.
 ///
-/// The staging buffer is mapped once and written via memcpy each frame.
-/// A vkCmdCopyBuffer (staging -> SSBO) runs before the render pass, followed
-/// by a TRANSFER -> SHADER_READ barrier.  This avoids the HOST_BIT pipeline
-/// stage which MoltenVK/Metal does not reliably support.
+/// Tries DEVICE_LOCAL memory first (discrete GPU: fast DMA path via staging +
+/// vkCmdCopyBuffer).  Falls back to HOST_VISIBLE (unified memory: Apple Silicon,
+/// Intel iGPU) where vkCmdUpdateBuffer reads directly from the host pointer
+/// without a staging copy, avoiding MoltenVK cache-coherency bugs
+/// (MoltenVK issue #1846).
 fn createInstanceBuffer(
     vki: vk.InstanceWrapper,
     vkd: vk.DeviceWrapper,
@@ -785,11 +822,11 @@ fn createInstanceBuffer(
 ) !struct {
     ssbo: vk.Buffer,
     ssbo_memory: vk.DeviceMemory,
+    upload_method: UploadMethod,
     staging: vk.Buffer,
     staging_memory: vk.DeviceMemory,
     staging_ptr: [*]u8,
 } {
-    // Device-local SSBO for GPU reads.
     const ssbo = try vkd.createBuffer(device, &.{
         .size = size,
         .usage = .{ .storage_buffer_bit = true, .transfer_dst_bit = true },
@@ -797,52 +834,75 @@ fn createInstanceBuffer(
     }, null);
     errdefer vkd.destroyBuffer(device, ssbo, null);
 
-    const ssbo_mem_req = vkd.getBufferMemoryRequirements(device, ssbo);
-    const ssbo_mem_type = try findMemoryType(
-        vki,
-        physical,
-        ssbo_mem_req.memory_type_bits,
-        .{ .device_local_bit = true },
-    );
-    const ssbo_mem = try vkd.allocateMemory(device, &.{
-        .allocation_size = ssbo_mem_req.size,
-        .memory_type_index = ssbo_mem_type,
-    }, null);
-    errdefer vkd.freeMemory(device, ssbo_mem, null);
-    try vkd.bindBufferMemory(device, ssbo, ssbo_mem, 0);
+    const mem_req = vkd.getBufferMemoryRequirements(device, ssbo);
 
-    // Host-visible staging buffer for CPU writes.
-    const staging = try vkd.createBuffer(device, &.{
-        .size = size,
-        .usage = .{ .transfer_src_bit = true },
-        .sharing_mode = .exclusive,
-    }, null);
-    errdefer vkd.destroyBuffer(device, staging, null);
+    if (findMemoryType(vki, physical, mem_req.memory_type_bits, .{ .device_local_bit = true })) |dev_local_idx| {
+        // Discrete GPU: device-local SSBO + host-visible staging.
+        const ssbo_mem = try vkd.allocateMemory(device, &.{
+            .allocation_size = mem_req.size,
+            .memory_type_index = dev_local_idx,
+        }, null);
+        errdefer vkd.freeMemory(device, ssbo_mem, null);
+        try vkd.bindBufferMemory(device, ssbo, ssbo_mem, 0);
 
-    const staging_mem_req = vkd.getBufferMemoryRequirements(device, staging);
-    const staging_mem_type = try findMemoryType(
-        vki,
-        physical,
-        staging_mem_req.memory_type_bits,
-        .{ .host_visible_bit = true, .host_coherent_bit = true },
-    );
-    const staging_mem = try vkd.allocateMemory(device, &.{
-        .allocation_size = staging_mem_req.size,
-        .memory_type_index = staging_mem_type,
-    }, null);
-    errdefer vkd.freeMemory(device, staging_mem, null);
-    try vkd.bindBufferMemory(device, staging, staging_mem, 0);
+        const staging = try vkd.createBuffer(device, &.{
+            .size = size,
+            .usage = .{ .transfer_src_bit = true },
+            .sharing_mode = .exclusive,
+        }, null);
+        errdefer vkd.destroyBuffer(device, staging, null);
 
-    const raw_ptr = (try vkd.mapMemory(device, staging_mem, 0, size, .{})) orelse
-        return error.MapMemoryReturnedNull;
+        const staging_mem_req = vkd.getBufferMemoryRequirements(device, staging);
+        const staging_mem_type = try findMemoryType(
+            vki,
+            physical,
+            staging_mem_req.memory_type_bits,
+            .{ .host_visible_bit = true, .host_coherent_bit = true },
+        );
+        const staging_mem = try vkd.allocateMemory(device, &.{
+            .allocation_size = staging_mem_req.size,
+            .memory_type_index = staging_mem_type,
+        }, null);
+        errdefer vkd.freeMemory(device, staging_mem, null);
+        try vkd.bindBufferMemory(device, staging, staging_mem, 0);
 
-    return .{
-        .ssbo = ssbo,
-        .ssbo_memory = ssbo_mem,
-        .staging = staging,
-        .staging_memory = staging_mem,
-        .staging_ptr = @ptrCast(@alignCast(raw_ptr)),
-    };
+        const raw_ptr = (try vkd.mapMemory(device, staging_mem, 0, size, .{})) orelse
+            return error.MapMemoryReturnedNull;
+
+        return .{
+            .ssbo = ssbo,
+            .ssbo_memory = ssbo_mem,
+            .upload_method = .staging_copy,
+            .staging = staging,
+            .staging_memory = staging_mem,
+            .staging_ptr = @ptrCast(@alignCast(raw_ptr)),
+        };
+    } else |_| {
+        // Unified memory: no dedicated VRAM.  Use HOST_VISIBLE directly;
+        // vkCmdUpdateBuffer reads from the host pointer each frame without
+        // a staging memcpy or intermediate copy.
+        const host_idx = try findMemoryType(
+            vki,
+            physical,
+            mem_req.memory_type_bits,
+            .{ .host_visible_bit = true, .host_coherent_bit = true },
+        );
+        const ssbo_mem = try vkd.allocateMemory(device, &.{
+            .allocation_size = mem_req.size,
+            .memory_type_index = host_idx,
+        }, null);
+        errdefer vkd.freeMemory(device, ssbo_mem, null);
+        try vkd.bindBufferMemory(device, ssbo, ssbo_mem, 0);
+
+        return .{
+            .ssbo = ssbo,
+            .ssbo_memory = ssbo_mem,
+            .upload_method = .update_buffer,
+            .staging = .null_handle,
+            .staging_memory = .null_handle,
+            .staging_ptr = undefined,
+        };
+    }
 }
 
 /// Create descriptor set layout, pool, and set for the instance SSBO.

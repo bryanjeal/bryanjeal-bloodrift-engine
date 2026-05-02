@@ -94,8 +94,14 @@ fn choosePresentMode(
 ) !vk.PresentModeKHR {
     const modes = try vki.getPhysicalDeviceSurfacePresentModesAllocKHR(physical, surface, allocator);
     defer allocator.free(modes);
+    // Preference order: MAILBOX (no vsync, no tearing) > IMMEDIATE (no vsync,
+    // may tear) > FIFO (vsync locked).  Older MoltenVK versions on Intel Macs
+    // often lack MAILBOX but do expose IMMEDIATE.
     for (modes) |m| {
         if (m == .mailbox_khr) return m;
+    }
+    for (modes) |m| {
+        if (m == .immediate_khr) return m;
     }
     return .fifo_khr; // guaranteed to be present
 }
