@@ -104,6 +104,7 @@ pub fn build(b: *std.Build) void {
     engine_tests.linkLibrary(imgui_lib);
     linkSdl3(engine_tests, sdl3_path);
     linkVulkan(engine_tests, vulkan_sdk);
+    linkZstd(engine_tests);
 
     const run_engine_tests = b.addRunArtifact(engine_tests);
 
@@ -175,6 +176,25 @@ pub fn linkVulkan(step: *std.Build.Step.Compile, vulkan_sdk: []const u8) void {
             step.addLibraryPath(.{ .cwd_relative = lib_path });
             step.root_module.addIncludePath(.{ .cwd_relative = inc_path });
             step.linkSystemLibrary("vulkan-1");
+        },
+        else => {},
+    }
+}
+
+/// Link the zstd compression library for a compile step.
+/// On macOS (Homebrew), libzstd lives under /usr/local/opt/zstd.
+/// On Linux, install via libzstd-dev or similar.
+pub fn linkZstd(step: *std.Build.Step.Compile) void {
+    switch (step.rootModuleTarget().os.tag) {
+        .macos => {
+            step.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/zstd/lib" });
+            step.linkSystemLibrary("zstd");
+        },
+        .linux => {
+            step.linkSystemLibrary("zstd");
+        },
+        .windows => {
+            step.linkSystemLibrary("zstd");
         },
         else => {},
     }
