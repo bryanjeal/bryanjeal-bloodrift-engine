@@ -16,6 +16,25 @@ engine/src/root.zig          ← game code imports this as "engine"
 
 Each subsystem's `root.zig` re-exports the public API. Internal modules are not importable by game code.
 
+## Directory Structure
+
+```
+engine/
+├── src/
+│   ├── root.zig              # Public entry point ("engine" import)
+│   ├── core/                 # ECS (World wrapper), math (Fp16/FVec3/FQuat), memory, allocators
+│   ├── renderer/             # Renderer abstraction + Vulkan backend
+│   │   └── vulkan/           # Vulkan-specific pipeline, shaders, swapchain
+│   ├── platform/             # SDL3 windowing, input, Vulkan surface
+│   ├── network/              # Transport abstraction + TCP
+│   ├── physics/              # Jolt Physics integration
+│   └── audio/                # FMOD integration
+├── build.zig                 # Engine build (linkSdl3, linkVulkan, shader compilation)
+└── build.zig.zon
+```
+
+For Zig conventions (TIGER_STYLE overrides, antipatterns, code style), see the project root CLAUDE.md.
+
 ## linkSdl3 / linkVulkan Pattern
 
 Both functions are `pub` in `engine/build.zig` and **mirrored** in the root `build.zig`. Both copies must stay in sync.
@@ -96,6 +115,15 @@ desc.events[0] = zflecs.OnAdd;
 desc.query.terms[0] = .{ .id = zflecs.id(MyComponent) };
 _ = zflecs.observer_init(world.raw, &desc);
 ```
+
+## Build & Test
+
+```bash
+zig build test              # Engine test suite (from engine/ directory)
+zig build test --watch      # Continuous testing during engine development
+```
+
+Run from the project root: `zig build test` also runs engine tests (engine is a dependency).
 
 ## Zig 0.15.2 Compatibility Notes
 
